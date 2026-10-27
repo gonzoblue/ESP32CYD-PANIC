@@ -16,6 +16,8 @@ constexpr uint8_t BmeMiso = 19;
 constexpr uint8_t BmeMosi = 23;
 constexpr uint8_t BmeCs = 27;
 
+constexpr uint8_t BatteryAdc = 34;
+
 constexpr uint8_t GpsRx = 3;
 constexpr uint8_t GpsTx = 1;
 }

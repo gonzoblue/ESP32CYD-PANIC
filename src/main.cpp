@@ -1,9 +1,16 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <TFT_eSPI.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <math.h>
 
 #include "bme_sensor.h"
+#include "backlight_policy.h"
 #include "board_pins.h"
 #include "gps_sensor.h"
+#include "power_monitor.h"
 #include "resistive_touch.h"
 
 namespace
@@ -11,6 +18,18 @@ namespace
 constexpr uint8_t CalibrationPointCount = 4;
 constexpr uint8_t CalibrationSamples = 16;
 constexpr uint16_t CalibrationInset = 20;
+constexpr int16_t CalibrationButtonWidth = 38;
+constexpr int16_t CalibrationButtonHeight = 24;
+constexpr int16_t CalibrationButtonTop = 18;
+constexpr int16_t CalibrationButtonRightInset = 8;
+constexpr int16_t PageButtonWidth = 50;
+constexpr int16_t PageButtonHeight = 22;
+constexpr int16_t PageButtonRightInset = 8;
+constexpr int16_t PageButtonBottomInset = 8;
+constexpr uint32_t CalibrationStorageMagic = 0x5443414CUL;
+constexpr uint32_t CalibrationStorageVersion = 1;
+constexpr uint32_t CalibrationResultDurationMs = 15000;
+constexpr uint32_t SystemStatsRefreshMs = 1000;
 
 struct CalibrationPoint
 {
@@ -26,10 +45,19 @@ struct ScreenPoint
     int16_t y;
 };
 
+struct StoredTouchCalibration
+{
+    uint32_t magic;
+    uint32_t version;
+    double xCoefficients[3];
+    double yCoefficients[3];
+};
+
 TFT_eSPI tft;
 ResistiveTouch touch;
 BmeSensor bme;
 GpsSensor gps;
+PowerMonitor powerMonitor;
 CalibrationPoint calibrationPoints[CalibrationPointCount];
 double xCoefficients[3];
 double yCoefficients[3];
@@ -39,7 +67,15 @@ BmeReadings latestBmeReadings = {};
 bool bmeAvailable = false;
 uint32_t lastBmeRead = 0;
 uint32_t lastGpsDiagnostics = 0;
+uint32_t lastPowerDiagnostics = 0;
+uint32_t lastSystemStatsDraw = 0;
 char latestGpsNmea[128] = {};
+bool systemPageActive = false;
+bool backlightOn = true;
+bool consumingWakeTouch = false;
+uint32_t lastTouchTime = 0;
+uint32_t lastDarkRefresh = 0;
+PowerReadings latestPowerReadings = {};
 constexpr bool EchoGpsNmeaToSerial = true;
 
 bool solveSystem(const double matrix[3][3], const double values[3], double result[3])
@@ -108,6 +144,26 @@ bool solveSystem(const double matrix[3][3], const double values[3], double resul
     return true;
 }
 
+bool isMappingValid(const double mappingX[3], const double mappingY[3])
+{
+    for (uint8_t index = 0; index < 3; ++index)
+    {
+        if (!isfinite(mappingX[index]) || !isfinite(mappingY[index]))
+        {
+            return false;
+        }
+    }
+
+    const double determinant =
+        mappingX[0] * mappingY[1] - mappingX[1] * mappingY[0];
+    if (!isfinite(determinant) || fabs(determinant) < 1e-8)
+    {
+        return false;
+    }
+
+    return true;
+}
+
 bool calculateCalibration()
 {
     double normalMatrix[3][3] = {};
@@ -128,8 +184,96 @@ bool calculateCalibration()
         }
     }
 
-    return solveSystem(normalMatrix, xValues, xCoefficients) &&
-           solveSystem(normalMatrix, yValues, yCoefficients);
+    double calculatedX[3];
+    double calculatedY[3];
+    if (!solveSystem(normalMatrix, xValues, calculatedX) ||
+        !solveSystem(normalMatrix, yValues, calculatedY))
+    {
+        return false;
+    }
+
+    if (!isMappingValid(calculatedX, calculatedY))
+    {
+        return false;
+    }
+
+    for (uint8_t index = 0; index < 3; ++index)
+    {
+        xCoefficients[index] = calculatedX[index];
+        yCoefficients[index] = calculatedY[index];
+    }
+    return true;
+}
+
+bool isCalibrationValid(const StoredTouchCalibration &stored)
+{
+    if (stored.magic != CalibrationStorageMagic ||
+        stored.version != CalibrationStorageVersion)
+    {
+        return false;
+    }
+
+    return isMappingValid(stored.xCoefficients, stored.yCoefficients);
+}
+
+bool loadCalibration()
+{
+    Preferences preferences;
+    if (!preferences.begin("touchcal", true))
+    {
+        Serial.println("Touch calibration NVS open failed; running calibration.");
+        return false;
+    }
+
+    StoredTouchCalibration stored = {};
+    const size_t bytesRead =
+        preferences.getBytes("mapping", &stored, sizeof(stored));
+    preferences.end();
+
+    if (bytesRead != sizeof(stored) || !isCalibrationValid(stored))
+    {
+        Serial.println("No valid saved touch calibration; running calibration.");
+        return false;
+    }
+
+    for (uint8_t index = 0; index < 3; ++index)
+    {
+        xCoefficients[index] = stored.xCoefficients[index];
+        yCoefficients[index] = stored.yCoefficients[index];
+    }
+    Serial.println("Loaded touch calibration from NVS.");
+    return true;
+}
+
+bool saveCalibration()
+{
+    StoredTouchCalibration stored = {};
+    stored.magic = CalibrationStorageMagic;
+    stored.version = CalibrationStorageVersion;
+    for (uint8_t index = 0; index < 3; ++index)
+    {
+        stored.xCoefficients[index] = xCoefficients[index];
+        stored.yCoefficients[index] = yCoefficients[index];
+    }
+
+    Preferences preferences;
+    if (!preferences.begin("touchcal", false))
+    {
+        Serial.println("Touch calibration NVS open failed; calibration is active but not saved.");
+        return false;
+    }
+
+    const size_t bytesWritten =
+        preferences.putBytes("mapping", &stored, sizeof(stored));
+    preferences.end();
+    if (bytesWritten != sizeof(stored))
+    {
+        Serial.println("Touch calibration NVS write failed; calibration is active but not saved.");
+        return false;
+    }
+
+    Serial.println("Saved touch calibration to NVS.");
+    return true;
 }
 
 ScreenPoint mapTouch(const RawTouchPoint &raw)
@@ -157,13 +301,53 @@ void drawCross(int16_t x, int16_t y, uint16_t color)
 void drawCalibrationScreen(uint8_t pointIndex, int16_t targetX, int16_t targetY)
 {
     tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Touch calibration", tft.width() / 2, 76, 2);
+    tft.drawString("Tap the green target", tft.width() / 2, 96, 2);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(String("Point ") + String(pointIndex + 1) + " of 4",
+                   tft.width() / 2, 112, 2);
+
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("Touch calibration", 8, 8, 2);
-    tft.drawString("Tap the green target", 8, 32, 2);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString(String("Point ") + String(pointIndex + 1) + " of 4", 8, 56, 2);
+    for (uint8_t index = 0; index < pointIndex; ++index)
+    {
+        const CalibrationPoint &point = calibrationPoints[index];
+        const String reading =
+            String("P") + String(index + 1) + " X:" +
+            String(point.rawX, 0) + " Y:" + String(point.rawY, 0) +
+            " -> " + String(point.screenX, 0) + "," +
+            String(point.screenY, 0);
+        tft.drawString(reading, 8, 132 + index * 16, 1);
+    }
+
     drawCross(targetX, targetY, TFT_GREEN);
+}
+
+void showCalibrationResult(const char *heading, const char *details,
+                           uint16_t headingColor)
+{
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(headingColor, TFT_BLACK);
+    tft.drawString(heading, tft.width() / 2, 34, 2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(details, tft.width() / 2, 58, 1);
+
+    tft.setTextDatum(TL_DATUM);
+    for (uint8_t index = 0; index < CalibrationPointCount; ++index)
+    {
+        const CalibrationPoint &point = calibrationPoints[index];
+        const String reading =
+            String("P") + String(index + 1) + " X:" +
+            String(point.rawX, 0) + " Y:" + String(point.rawY, 0) +
+            " -> " + String(point.screenX, 0) + "," +
+            String(point.screenY, 0);
+        tft.drawString(reading, 8, 84 + index * 20, 1);
+    }
+
+    delay(CalibrationResultDurationMs);
 }
 
 void waitForRelease()
@@ -244,11 +428,16 @@ bool runCalibration()
     const int16_t targetX[CalibrationPointCount] = {left, right, right, left};
     const int16_t targetY[CalibrationPointCount] = {top, top, bottom, bottom};
 
+    for (uint8_t point = 0; point < CalibrationPointCount; ++point)
+    {
+        calibrationPoints[point] = {};
+    }
+
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("Touch calibration", tft.width() / 2, tft.height() / 2 - 12, 2);
-    tft.drawString("Tap each green target", tft.width() / 2, tft.height() / 2 + 14, 2);
+    tft.drawString("Touch calibration", tft.width() / 2, 82, 2);
+    tft.drawString("Tap each green target", tft.width() / 2, 108, 2);
     delay(1200);
     waitForRelease();
 
@@ -263,18 +452,12 @@ bool runCalibration()
     if (!calculateCalibration())
     {
         Serial.println("Touch calibration failed: points do not define a usable mapping.");
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        tft.drawString("Calibration failed", tft.width() / 2, tft.height() / 2, 2);
+        showCalibrationResult("CALIBRATION FAILED", "Invalid touch mapping",
+                              TFT_RED);
         return false;
     }
 
     Serial.println("Touch calibration complete.");
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("Calibration complete", tft.width() / 2, tft.height() / 2, 2);
-    delay(900);
     return true;
 }
 
@@ -311,9 +494,193 @@ void drawRuntimeHeader(int16_t x, int16_t y, const RawTouchPoint &raw)
     const String touchCoordinates =
         String("X: ") + String(x) + " (" + String(raw.x) + ") Y: " +
         String(y) + " (" + String(raw.y) + ")";
+    const int16_t buttonX =
+        tft.width() - CalibrationButtonRightInset - CalibrationButtonWidth;
     const uint8_t coordinateFont =
-        tft.textWidth(touchCoordinates, 2) <= tft.width() - 16 ? 2 : 1;
+        tft.textWidth(touchCoordinates, 2) <= buttonX - 16 ? 2 : 1;
     tft.drawString(touchCoordinates, 8, 20, coordinateFont);
+
+    tft.fillRoundRect(buttonX, CalibrationButtonTop, CalibrationButtonWidth,
+                      CalibrationButtonHeight, 4, TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawCentreString("CAL", buttonX + CalibrationButtonWidth / 2,
+                         CalibrationButtonTop + 6, 1);
+}
+
+int16_t pageButtonX()
+{
+    return tft.width() - PageButtonRightInset - PageButtonWidth;
+}
+
+int16_t pageButtonY()
+{
+    return tft.height() - PageButtonBottomInset - PageButtonHeight;
+}
+
+void drawPageButton(const char *label)
+{
+    const int16_t buttonX = pageButtonX();
+    const int16_t buttonY = pageButtonY();
+    tft.fillRoundRect(buttonX, buttonY, PageButtonWidth, PageButtonHeight,
+                      4, TFT_DARKGREY);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString(label, buttonX + PageButtonWidth / 2,
+                   buttonY + PageButtonHeight / 2, 1);
+}
+
+bool isPageButtonTouch(const ScreenPoint &point)
+{
+    return point.x >= pageButtonX() &&
+           point.x < pageButtonX() + PageButtonWidth &&
+           point.y >= pageButtonY() &&
+           point.y < pageButtonY() + PageButtonHeight;
+}
+
+const char *resetReasonName(esp_reset_reason_t reason)
+{
+    switch (reason)
+    {
+    case ESP_RST_POWERON:
+        return "Power on";
+    case ESP_RST_EXT:
+        return "External reset";
+    case ESP_RST_SW:
+        return "Software reset";
+    case ESP_RST_PANIC:
+        return "Exception/panic";
+    case ESP_RST_INT_WDT:
+        return "Interrupt watchdog";
+    case ESP_RST_TASK_WDT:
+        return "Task watchdog";
+    case ESP_RST_WDT:
+        return "Watchdog";
+    case ESP_RST_DEEPSLEEP:
+        return "Deep sleep wake";
+    case ESP_RST_BROWNOUT:
+        return "Brownout";
+    case ESP_RST_SDIO:
+        return "SDIO reset";
+    case ESP_RST_USB:
+        return "USB reset";
+    case ESP_RST_JTAG:
+        return "JTAG reset";
+    case ESP_RST_EFUSE:
+        return "eFuse error";
+    case ESP_RST_PWR_GLITCH:
+        return "Power glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "CPU lockup";
+    case ESP_RST_UNKNOWN:
+    default:
+        return "Unknown";
+    }
+}
+
+void drawSystemDynamicStats()
+{
+    tft.fillRect(0, 88, tft.width(), 104, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String("Heap free/min: ") +
+                       String(static_cast<unsigned long>(ESP.getFreeHeap() / 1024)) +
+                       "/" +
+                       String(static_cast<unsigned long>(ESP.getMinFreeHeap() / 1024)) +
+                       " KB",
+                   8, 90, 1);
+
+    const uint32_t uptimeSeconds = millis() / 1000;
+    const uint32_t days = uptimeSeconds / 86400;
+    const uint32_t hours = (uptimeSeconds / 3600) % 24;
+    const uint32_t minutes = (uptimeSeconds / 60) % 60;
+    const uint32_t seconds = uptimeSeconds % 60;
+    char uptime[32];
+    snprintf(uptime, sizeof(uptime), "Uptime: %lu d %02lu:%02lu:%02lu",
+             static_cast<unsigned long>(days),
+             static_cast<unsigned long>(hours),
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+    tft.drawString(uptime, 8, 106, 1);
+
+    wifi_mode_t wifiMode = WIFI_MODE_NULL;
+    const esp_err_t wifiResult = esp_wifi_get_mode(&wifiMode);
+    const char *wifiStatus = "ERROR";
+    if (wifiResult == ESP_ERR_WIFI_NOT_INIT)
+    {
+        wifiStatus = "OFF (not initialized)";
+    }
+    else if (wifiResult == ESP_OK)
+    {
+        wifiStatus = wifiMode == WIFI_MODE_NULL ? "OFF" : "configured";
+    }
+    else
+    {
+        Serial.printf("Wi-Fi state query failed: %s\n", esp_err_to_name(wifiResult));
+    }
+    tft.drawString(String("Wi-Fi: ") + wifiStatus, 8, 122, 1);
+    const esp_bt_controller_status_t bluetoothStatus = esp_bt_controller_get_status();
+    tft.drawString(String("BT: ") +
+                       (bluetoothStatus == ESP_BT_CONTROLLER_STATUS_ENABLED
+                            ? "ON"
+                            : bluetoothStatus == ESP_BT_CONTROLLER_STATUS_IDLE
+                                  ? "OFF (not initialized)"
+                                  : "OFF (initialized)"),
+                   8, 138, 1);
+    tft.drawString(String("ILI9341 320x240 BL: ") + (backlightOn ? "ON" : "OFF"),
+                   8, 154, 1);
+    tft.drawString(String("Saver: 60s idle <90%; dark refresh 5s"),
+                   8, 170, 1);
+    if (latestPowerReadings.batteryVoltageValid)
+    {
+        tft.drawString(String("Power: ") + String(latestPowerReadings.batteryVoltage, 2) +
+                           " V (" + String(latestPowerReadings.estimatedChargePercent) +
+                           "% est.)",
+                       8, 184, 1);
+    }
+}
+
+void drawSystemDiagnosticsScreen()
+{
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("ESP32 SYSTEM", 8, 8, 2);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(String(ESP.getChipModel()) + " rev " +
+                       String(static_cast<unsigned>(ESP.getChipRevision())) +
+                       " / " + String(static_cast<unsigned>(ESP.getChipCores())) +
+                       " cores",
+                   8, 36, 1);
+    tft.drawString(String("CPU: ") +
+                       String(static_cast<unsigned long>(ESP.getCpuFreqMHz())) +
+                       " MHz / Flash: " +
+                       String(static_cast<unsigned long>(ESP.getFlashChipSize() / (1024UL * 1024UL))) +
+                       " MB",
+                   8, 54, 1);
+
+    const uint32_t psramSize = ESP.getPsramSize();
+    String psram = "PSRAM: ";
+    if (psramSize == 0)
+    {
+        psram += "not detected";
+    }
+    else
+    {
+        psram += String(static_cast<unsigned long>(psramSize / 1024)) +
+                 " KB total, " +
+                 String(static_cast<unsigned long>(ESP.getFreePsram() / 1024)) +
+                 " KB free";
+    }
+    tft.drawString(psram, 8, 72, 1);
+
+    drawSystemDynamicStats();
+    tft.drawString(String("Reset: ") + resetReasonName(esp_reset_reason()),
+                   8, 198, 1);
+    tft.drawString(String("ESP-IDF: ") + ESP.getSdkVersion(),
+                   8, 214, 1);
+    drawPageButton("APP");
+    lastSystemStatsDraw = millis();
 }
 
 void drawBmeDiagnostics()
@@ -369,12 +736,15 @@ void updateBmeDiagnostics()
         Serial.println("BME280 read failed; no replacement values are being reported.");
     }
 
-    drawBmeDiagnostics();
+    if (!systemPageActive && backlightOn)
+    {
+        drawBmeDiagnostics();
+    }
 }
 
 void drawGpsDiagnostics(const GpsReadings &readings)
 {
-    tft.fillRect(0, 156, tft.width(), 84, TFT_BLACK);
+    tft.fillRect(0, 156, tft.width(), 76, TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(readings.hasFix ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
     tft.drawString(readings.hasFix ? "GPS  FIX" :
@@ -414,7 +784,47 @@ void drawGpsDiagnostics(const GpsReadings &readings)
     tft.drawString(status, 8, 209, 1);
 
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString(String(latestGpsNmea).substring(0, 52), 8, 223, 1);
+    tft.drawString(String(latestGpsNmea).substring(0, 40), 8, 223, 1);
+    drawPageButton("SYS");
+}
+
+void drawPowerDiagnostics(const PowerReadings &readings)
+{
+    tft.fillRect(0, 232, tft.width(), 8, TFT_BLACK);
+    if (!readings.batteryVoltageValid)
+    {
+        return;
+    }
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(
+        String("Power ") + String(readings.batteryVoltage, 2) + " V (" +
+            String(readings.estimatedChargePercent) + "%)",
+        8, 232, 1);
+}
+
+void updatePowerDiagnostics()
+{
+    const uint32_t now = millis();
+    if (now - lastPowerDiagnostics < 2000)
+    {
+        return;
+    }
+    lastPowerDiagnostics = now;
+
+    const PowerReadings readings = powerMonitor.read();
+    latestPowerReadings = readings;
+    if (!systemPageActive && backlightOn)
+    {
+        drawPowerDiagnostics(readings);
+    }
+    if (readings.batteryVoltageValid)
+    {
+        Serial.printf("Power -> %.2f V (estimated charge %u%%)\n",
+                      readings.batteryVoltage,
+                      static_cast<unsigned>(readings.estimatedChargePercent));
+    }
 }
 
 void printGpsDiagnostics(const GpsReadings &readings)
@@ -497,7 +907,90 @@ void updateGpsDiagnostics()
         latestGpsNmea[0] = '\0';
     }
     printGpsDiagnostics(readings);
-    drawGpsDiagnostics(readings);
+    if (!systemPageActive && backlightOn)
+    {
+        drawGpsDiagnostics(readings);
+    }
+}
+
+void drawDiagnosticsScreen()
+{
+    systemPageActive = false;
+    tft.fillScreen(TFT_BLACK);
+    drawRuntimeHeader(0, 0, {0, 0, 0, 0});
+    drawBmeDiagnostics();
+    GpsReadings gpsReadings = {};
+    gps.read(gpsReadings);
+    drawGpsDiagnostics(gpsReadings);
+    drawPowerDiagnostics(latestPowerReadings);
+}
+
+void updateSystemDiagnostics()
+{
+    if (!systemPageActive || !backlightOn)
+    {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (now - lastSystemStatsDraw < SystemStatsRefreshMs)
+    {
+        return;
+    }
+
+    drawSystemDynamicStats();
+    lastSystemStatsDraw = now;
+}
+
+void redrawActivePage()
+{
+    if (systemPageActive)
+    {
+        drawSystemDiagnosticsScreen();
+    }
+    else
+    {
+        drawDiagnosticsScreen();
+    }
+    previousMarkerX = -1;
+    previousMarkerY = -1;
+}
+
+void updateBacklight()
+{
+    const uint32_t now = millis();
+    const bool blank = BacklightPolicy::shouldBlank(
+        latestPowerReadings.batteryVoltageValid,
+        latestPowerReadings.estimatedChargePercent,
+        now - lastTouchTime);
+    if (backlightOn && blank)
+    {
+        backlightOn = false;
+        digitalWrite(BoardPins::TftBacklight, LOW);
+        lastDarkRefresh = now;
+    }
+    else if (!backlightOn && !blank)
+    {
+        backlightOn = true;
+        redrawActivePage();
+        digitalWrite(BoardPins::TftBacklight, HIGH);
+    }
+
+    if (!backlightOn && BacklightPolicy::refreshDue(now, lastDarkRefresh))
+    {
+        redrawActivePage();
+        lastDarkRefresh = now;
+    }
+}
+
+bool isCalibrationButtonTouch(const ScreenPoint &point)
+{
+    const int16_t buttonX =
+        tft.width() - CalibrationButtonRightInset - CalibrationButtonWidth;
+    return point.x >= buttonX &&
+           point.x < buttonX + CalibrationButtonWidth &&
+           point.y >= CalibrationButtonTop &&
+           point.y < CalibrationButtonTop + CalibrationButtonHeight;
 }
 
 void runTouchDisplay()
@@ -506,12 +999,91 @@ void runTouchDisplay()
     static uint32_t lastSerialPrint = 0;
     static uint32_t lastDraw = 0;
 
+    if (consumingWakeTouch)
+    {
+        lastTouchTime = millis();
+        if (!touch.isPressed())
+        {
+            consumingWakeTouch = false;
+        }
+        return;
+    }
+
+    if (!backlightOn && touch.isPressed())
+    {
+        lastTouchTime = millis();
+        consumingWakeTouch = true;
+        backlightOn = true;
+        redrawActivePage();
+        digitalWrite(BoardPins::TftBacklight, HIGH);
+        return;
+    }
+
+    if (touch.isPressed())
+    {
+        lastTouchTime = millis();
+    }
+
     if (!touch.read(raw))
     {
         return;
     }
 
+    lastTouchTime = millis();
     const ScreenPoint mapped = mapTouch(raw);
+    if (systemPageActive)
+    {
+        if (isPageButtonTouch(mapped))
+        {
+            waitForRelease();
+            lastTouchTime = millis();
+            drawDiagnosticsScreen();
+            previousMarkerX = -1;
+            previousMarkerY = -1;
+        }
+        return;
+    }
+
+    if (isPageButtonTouch(mapped))
+    {
+        waitForRelease();
+        lastTouchTime = millis();
+        systemPageActive = true;
+        drawSystemDiagnosticsScreen();
+        previousMarkerX = -1;
+        previousMarkerY = -1;
+        return;
+    }
+
+    if (isCalibrationButtonTouch(mapped))
+    {
+        Serial.println("Touch calibration requested from CAL button.");
+        waitForRelease();
+        if (runCalibration())
+        {
+            if (saveCalibration())
+            {
+                showCalibrationResult("CALIBRATION SAVED", "Saved to NVS",
+                                      TFT_GREEN);
+            }
+            else
+            {
+                showCalibrationResult("CALIBRATION NOT SAVED",
+                                      "Active, but NVS write failed",
+                                      TFT_YELLOW);
+            }
+        }
+        else
+        {
+            Serial.println("Recalibration failed; retaining the previous mapping.");
+        }
+        drawDiagnosticsScreen();
+        lastTouchTime = millis();
+        previousMarkerX = -1;
+        previousMarkerY = -1;
+        return;
+    }
+
     const uint32_t now = millis();
     if (now - lastSerialPrint >= 100)
     {
@@ -551,6 +1123,7 @@ void setup()
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
 
+    powerMonitor.begin();
     touch.begin();
     Serial.println("Touch SPI initialized on GPIO25/32/39/33.");
 
@@ -568,16 +1141,28 @@ void setup()
     Serial.println("GPS UART1 receive-only on exposed GPIO3/RX0 at 9600 baud; leave GPS RX disconnected.");
     Serial.println("GPIO3 is shared with the USB serial adapter; disconnect GPS TX if flashing or diagnostics are affected.");
 
-    while (!runCalibration())
+    if (!loadCalibration())
     {
-        delay(1000);
+        while (!runCalibration())
+        {
+            delay(1000);
+        }
+        if (saveCalibration())
+        {
+            showCalibrationResult("CALIBRATION SAVED", "Saved to NVS",
+                                  TFT_GREEN);
+        }
+        else
+        {
+            showCalibrationResult("CALIBRATION NOT SAVED",
+                                  "Active, but NVS write failed",
+                                  TFT_YELLOW);
+        }
     }
 
-    tft.fillScreen(TFT_BLACK);
-    drawRuntimeHeader(0, 0, {0, 0, 0, 0});
-    drawBmeDiagnostics();
-    GpsReadings gpsReadings = {};
-    drawGpsDiagnostics(gpsReadings);
+    latestPowerReadings = powerMonitor.read();
+    lastTouchTime = millis();
+    drawDiagnosticsScreen();
     Serial.println("Touch the screen to test calibrated coordinates.");
 }
 
@@ -585,6 +1170,9 @@ void loop()
 {
     updateBmeDiagnostics();
     updateGpsDiagnostics();
+    updatePowerDiagnostics();
     runTouchDisplay();
+    updateBacklight();
+    updateSystemDiagnostics();
     delay(8);
 }
