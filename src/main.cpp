@@ -3,6 +3,7 @@
 
 #include "bme_sensor.h"
 #include "board_pins.h"
+#include "gps_sensor.h"
 #include "resistive_touch.h"
 
 namespace
@@ -28,6 +29,7 @@ struct ScreenPoint
 TFT_eSPI tft;
 ResistiveTouch touch;
 BmeSensor bme;
+GpsSensor gps;
 CalibrationPoint calibrationPoints[CalibrationPointCount];
 double xCoefficients[3];
 double yCoefficients[3];
@@ -36,6 +38,9 @@ int16_t previousMarkerY = -1;
 BmeReadings latestBmeReadings = {};
 bool bmeAvailable = false;
 uint32_t lastBmeRead = 0;
+uint32_t lastGpsDiagnostics = 0;
+char latestGpsNmea[128] = {};
+constexpr bool EchoGpsNmeaToSerial = true;
 
 bool solveSystem(const double matrix[3][3], const double values[3], double result[3])
 {
@@ -277,12 +282,38 @@ void drawRuntimeHeader(int16_t x, int16_t y, const RawTouchPoint &raw)
 {
     tft.fillRect(0, 0, tft.width(), 54, TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("ESP32CYD-PANIC  Touch", 8, 4, 2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String("Screen X: ") + String(x) + "  Y: " + String(y), 8, 26, 2);
+    struct TitleSegment
+    {
+        const char *text;
+        uint16_t color;
+    };
+    const TitleSegment segments[] = {
+        {"P", TFT_GREEN},
+        {"ortable ", TFT_WHITE},
+        {"A", TFT_GREEN},
+        {"ltitude, ", TFT_WHITE},
+        {"N", TFT_GREEN},
+        {"avigation, and ", TFT_WHITE},
+        {"I", TFT_GREEN},
+        {"n-situ ", TFT_WHITE},
+        {"C", TFT_GREEN},
+        {"onditions", TFT_WHITE}};
+
+    int16_t titleX = 1;
+    for (const TitleSegment &segment : segments)
+    {
+        tft.setTextColor(segment.color, TFT_BLACK);
+        tft.drawString(segment.text, titleX, 4, 1);
+        titleX += tft.textWidth(segment.text, 1);
+    }
+
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString(String("Raw X: ") + String(raw.x) + "  Y: " + String(raw.y), 8, 44, 1);
+    const String touchCoordinates =
+        String("X: ") + String(x) + " (" + String(raw.x) + ") Y: " +
+        String(y) + " (" + String(raw.y) + ")";
+    const uint8_t coordinateFont =
+        tft.textWidth(touchCoordinates, 2) <= tft.width() - 16 ? 2 : 1;
+    tft.drawString(touchCoordinates, 8, 20, coordinateFont);
 }
 
 void drawBmeDiagnostics()
@@ -341,6 +372,134 @@ void updateBmeDiagnostics()
     drawBmeDiagnostics();
 }
 
+void drawGpsDiagnostics(const GpsReadings &readings)
+{
+    tft.fillRect(0, 156, tft.width(), 84, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(readings.hasFix ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+    tft.drawString(readings.hasFix ? "GPS  FIX" :
+                   (readings.hasNmeaData ? "GPS  NO FIX" : "GPS  NO DATA"),
+                   8, 158, 2);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    if (readings.hasFix && readings.hasLatitudeLongitude)
+    {
+        tft.drawString(
+            String("Lat ") + String(readings.latitude, 6) +
+                "  Lon " + String(readings.longitude, 6),
+            8, 181, 1);
+        String motion = "Alt ";
+        motion += readings.hasAltitude
+                      ? String(readings.altitudeMeters, 1) + " m"
+                      : String("--");
+        motion += "  Speed ";
+        motion += readings.hasSpeed
+                      ? String(readings.speedKmph * 0.621371F, 1) + " mph"
+                      : String("--");
+        tft.drawString(motion, 8, 195, 1);
+    }
+    else
+    {
+        tft.drawString("Position unavailable", 8, 181, 1);
+    }
+
+    String status = "Satellites ";
+    status += readings.hasSatellites
+                  ? String(readings.satellites)
+                  : String("--");
+    status += "  Fix quality ";
+    status += readings.hasFixQuality
+                  ? String(readings.fixQuality)
+                  : String("--");
+    tft.drawString(status, 8, 209, 1);
+
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(String(latestGpsNmea).substring(0, 52), 8, 223, 1);
+}
+
+void printGpsDiagnostics(const GpsReadings &readings)
+{
+    if (!readings.hasNmeaData)
+    {
+        Serial.println("GPS -> NO DATA");
+        return;
+    }
+    if (!readings.hasFix)
+    {
+        Serial.print("GPS -> NO FIX");
+    }
+    else
+    {
+        Serial.print("GPS -> FIX");
+    }
+
+    if (readings.hasLatitudeLongitude)
+    {
+        Serial.printf("  Latitude: %.6f  Longitude: %.6f",
+                      readings.latitude, readings.longitude);
+    }
+    if (readings.hasAltitude)
+    {
+        Serial.printf("  Altitude: %.1f m", readings.altitudeMeters);
+    }
+    if (readings.hasSpeed)
+    {
+        Serial.printf("  Speed: %.2f km/h", readings.speedKmph);
+    }
+    if (readings.hasCourse)
+    {
+        Serial.printf("  Course: %.1f deg", readings.courseDegrees);
+    }
+    if (readings.hasSatellites)
+    {
+        Serial.printf("  Satellites: %lu",
+                      static_cast<unsigned long>(readings.satellites));
+    }
+    if (readings.hasFixQuality)
+    {
+        Serial.printf("  Fix quality: %u", readings.fixQuality);
+    }
+    if (readings.hasTime)
+    {
+        Serial.printf("  UTC: %02u:%02u:%02u",
+                      static_cast<unsigned>(readings.hour),
+                      static_cast<unsigned>(readings.minute),
+                      static_cast<unsigned>(readings.second));
+    }
+    Serial.println();
+}
+
+void updateGpsDiagnostics()
+{
+    gps.update();
+
+    char sentence[sizeof(latestGpsNmea)];
+    if (gps.takeNmeaSentence(sentence, sizeof(sentence)))
+    {
+        snprintf(latestGpsNmea, sizeof(latestGpsNmea), "%s", sentence);
+        if (EchoGpsNmeaToSerial)
+        {
+            Serial.printf("GPS NMEA -> %s\n", sentence);
+        }
+    }
+
+    const uint32_t now = millis();
+    if (now - lastGpsDiagnostics < 1000)
+    {
+        return;
+    }
+    lastGpsDiagnostics = now;
+
+    GpsReadings readings;
+    gps.read(readings);
+    if (!readings.hasNmeaData)
+    {
+        latestGpsNmea[0] = '\0';
+    }
+    printGpsDiagnostics(readings);
+    drawGpsDiagnostics(readings);
+}
+
 void runTouchDisplay()
 {
     RawTouchPoint raw;
@@ -382,7 +541,7 @@ void setup()
     Serial.begin(115200);
     delay(500);
     Serial.println();
-    Serial.println("ESP32CYD-PANIC");
+    Serial.println("Portable Altitude, Navigation, and In-situ Conditions");
     Serial.println("Starting E32R28T display and touchscreen test...");
 
     pinMode(BoardPins::TftBacklight, OUTPUT);
@@ -405,6 +564,10 @@ void setup()
         Serial.println("BME280 initialization failed; check SPI wiring, power, and sensor identity.");
     }
 
+    gps.begin();
+    Serial.println("GPS UART1 receive-only on exposed GPIO3/RX0 at 9600 baud; leave GPS RX disconnected.");
+    Serial.println("GPIO3 is shared with the USB serial adapter; disconnect GPS TX if flashing or diagnostics are affected.");
+
     while (!runCalibration())
     {
         delay(1000);
@@ -413,12 +576,15 @@ void setup()
     tft.fillScreen(TFT_BLACK);
     drawRuntimeHeader(0, 0, {0, 0, 0, 0});
     drawBmeDiagnostics();
+    GpsReadings gpsReadings = {};
+    drawGpsDiagnostics(gpsReadings);
     Serial.println("Touch the screen to test calibrated coordinates.");
 }
 
 void loop()
 {
     updateBmeDiagnostics();
+    updateGpsDiagnostics();
     runTouchDisplay();
     delay(8);
 }

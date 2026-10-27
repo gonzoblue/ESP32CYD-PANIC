@@ -1,2 +1,2 @@
-# ESP32CYD-PANIC
-ESP21 CYD Portable Altitude, Navigation, and Indoor/Outdoor Conditions unit.
+# Portable Altitude, Navigation, and In-situ Conditions
+ESP32 CYD Portable Altitude, Navigation, and In-situ Conditions unit.
