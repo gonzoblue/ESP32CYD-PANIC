@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 
+#include "bme_sensor.h"
 #include "board_pins.h"
 #include "resistive_touch.h"
 
@@ -26,11 +27,15 @@ struct ScreenPoint
 
 TFT_eSPI tft;
 ResistiveTouch touch;
+BmeSensor bme;
 CalibrationPoint calibrationPoints[CalibrationPointCount];
 double xCoefficients[3];
 double yCoefficients[3];
 int16_t previousMarkerX = -1;
 int16_t previousMarkerY = -1;
+BmeReadings latestBmeReadings = {};
+bool bmeAvailable = false;
+uint32_t lastBmeRead = 0;
 
 bool solveSystem(const double matrix[3][3], const double values[3], double result[3])
 {
@@ -280,6 +285,62 @@ void drawRuntimeHeader(int16_t x, int16_t y, const RawTouchPoint &raw)
     tft.drawString(String("Raw X: ") + String(raw.x) + "  Y: " + String(raw.y), 8, 44, 1);
 }
 
+void drawBmeDiagnostics()
+{
+    tft.fillRect(0, 64, tft.width(), 78, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(bmeAvailable ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawString(bmeAvailable ? "BME280  OK" : "BME280  ERROR", 8, 66, 2);
+
+    if (!bmeAvailable)
+    {
+        return;
+    }
+
+    const float temperatureF = latestBmeReadings.temperatureC * 1.8F + 32.0F;
+    const float altitudeFeet = latestBmeReadings.altitudeMeters * 3.28084F;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(
+        String("Temp ") + String(latestBmeReadings.temperatureC, 1) + " C / " +
+            String(temperatureF, 1) + " F  Hum " +
+            String(latestBmeReadings.humidityPercent, 1) + "%",
+        8, 90, 2);
+    tft.drawString(
+        String("Pressure ") + String(latestBmeReadings.pressureHpa, 1) + " hPa",
+        8, 114, 2);
+    tft.drawString(
+        String("Baro Alt ") + String(latestBmeReadings.altitudeMeters, 1) + " m / " +
+            String(altitudeFeet, 0) + " ft",
+        8, 136, 2);
+}
+
+void updateBmeDiagnostics()
+{
+    const uint32_t now = millis();
+    if (now - lastBmeRead < 1000)
+    {
+        return;
+    }
+    lastBmeRead = now;
+
+    BmeReadings readings;
+    bmeAvailable = bme.read(readings);
+    if (bmeAvailable)
+    {
+        latestBmeReadings = readings;
+        Serial.printf(
+            "BME280 -> Temperature: %.2f C  Humidity: %.2f %%  Pressure: %.2f hPa  Barometric altitude: %.2f m\n",
+            readings.temperatureC, readings.humidityPercent,
+            readings.pressureHpa, readings.altitudeMeters);
+    }
+    else
+    {
+        Serial.println("BME280 read failed; no replacement values are being reported.");
+    }
+
+    drawBmeDiagnostics();
+}
+
 void runTouchDisplay()
 {
     RawTouchPoint raw;
@@ -300,7 +361,7 @@ void runTouchDisplay()
         lastSerialPrint = now;
     }
 
-    if (now - lastDraw >= 35)
+    if (now - lastDraw >= 250)
     {
         if (previousMarkerX >= 0)
         {
@@ -334,6 +395,16 @@ void setup()
     touch.begin();
     Serial.println("Touch SPI initialized on GPIO25/32/39/33.");
 
+    bmeAvailable = bme.begin();
+    if (bmeAvailable)
+    {
+        Serial.println("BME280 initialized over SPI on GPIO18/19/23 with CS GPIO27.");
+    }
+    else
+    {
+        Serial.println("BME280 initialization failed; check SPI wiring, power, and sensor identity.");
+    }
+
     while (!runCalibration())
     {
         delay(1000);
@@ -341,11 +412,13 @@ void setup()
 
     tft.fillScreen(TFT_BLACK);
     drawRuntimeHeader(0, 0, {0, 0, 0, 0});
+    drawBmeDiagnostics();
     Serial.println("Touch the screen to test calibrated coordinates.");
 }
 
 void loop()
 {
+    updateBmeDiagnostics();
     runTouchDisplay();
     delay(8);
 }
